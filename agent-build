@@ -1,13 +1,27 @@
 #!/usr/bin/env python3
-"""agent-build: one heavy build at a time per machine, with a visible queue and cancel-with-a-reason.
+"""agent-build: shared slots for heavy work on one machine, with a visible queue.
 
-  agent-build COMMAND [ARG ...]          wait for the heavy slot, run COMMAND, release the slot
-  agent-build --light COMMAND [ARG ...]  the light slot: one small job (niced) beside the heavy one
-  agent-build --status                   who holds each slot, whether it is doing anything, who waits
-  agent-build --cancel [PID] REASON      stop a job; whoever started it reads REASON on its stderr
+  agent-build [CLASS ...] [OPTION ...] COMMAND [ARG ...]
+      Wait for the slots, run COMMAND, release them. Exit status is COMMAND's.
 
-The slot is a flock(2) on a file, held by this wrapper while COMMAND runs. The kernel drops it when
-the wrapper exits, however it exits, so there is never a stale lock to clean up.
+  Classes (combine them; the job gets all of its slots or keeps waiting with none):
+      (none)    heavy: a full build or test suite; one per machine
+      --light   one small job, niced, beside the heavy one
+      --gpu     the GPU: renders, GPU benchmarks, training
+      --sim     one long CPU job (a simulation batch) beside builds
+      --heavy   name the heavy slot explicitly, to combine it: --gpu --heavy
+
+  Options:
+      --mem GB                 memory the job will use; it starts only when that leaves the floor free
+      --max-wait MIN           give up after MIN minutes in the queue (default 10): exit 69
+      --max-minutes N REASON   hold the slots up to N minutes instead of the class limit
+                               (heavy 30, light 10, gpu 60, sim 120); past it the job is stopped: exit 75
+
+  agent-build --status                   every slot's holder, age and activity; the queue; memory
+  agent-build --cancel [PID] REASON      stop a job; whoever started it reads REASON: exit 75
+
+A slot is a lock held by this wrapper while COMMAND runs as its child. It ends with the wrapper,
+however the wrapper ends, so there is never a stale lock to clean up.
 """
 
 import errno
@@ -19,11 +33,38 @@ import subprocess
 import sys
 import time
 
-HEAVY, LIGHT = "0", "light"
-NAMES = {HEAVY: "heavy", LIGHT: "light"}
-CANCELLED = 75  # EX_TEMPFAIL: the job was stopped by --cancel
-GRACE_S = 10.0  # between SIGTERM and SIGKILL of a cancelled job's process group
-HELD_VAR = os.environ.get("AGENT_BUILD_ENV", "AGENT_BUILD_HELD")
+HEAVY, LIGHT, GPU, SIM = "0", "light", "gpu", "sim"
+SLOTS = (HEAVY, LIGHT, GPU, SIM)  # also the order locks are tried in
+NAMES = {HEAVY: "heavy", LIGHT: "light", GPU: "gpu", SIM: "sim"}
+IDS = {v: k for k, v in NAMES.items()}
+GAVE_UP = 69  # EX_UNAVAILABLE: the wait ran out, nothing was run
+STOPPED = 75  # EX_TEMPFAIL: cancelled, or past its hold limit
+GRACE_S = 10.0  # between SIGTERM and SIGKILL of a stopped job's process group
+
+OWN_VAR = "AGENT_BUILD_HELD"  # "PID:slot,slot;PID:slot": slots held up the process tree
+COMPAT_VAR = os.environ.get("AGENT_BUILD_ENV")  # a foreign gate's "PID:slot" variable, if any
+GPU_PIDFILE = os.environ.get("AGENT_BUILD_GPU_PIDFILE")  # a foreign GPU lock: a file holding the owner's PID
+GPU_VAR = os.environ.get("AGENT_BUILD_GPU_ENV")  # the variable that foreign GPU lock reads for nesting
+
+
+def minutes(text, what):
+    try:
+        v = float(text)
+    except ValueError:
+        v = -1.0
+    if v < 0:
+        raise SystemExit("agent-build: %s must be a number of minutes, got %r" % (what, text))
+    return v
+
+
+def limits():
+    out = {HEAVY: 30.0, LIGHT: 10.0, GPU: 60.0, SIM: 120.0}
+    for part in filter(None, os.environ.get("AGENT_BUILD_LIMITS", "").split(",")):
+        name, _, val = part.partition("=")
+        if name not in IDS:
+            raise SystemExit("agent-build: AGENT_BUILD_LIMITS names an unknown class %r" % name)
+        out[IDS[name]] = minutes(val, "AGENT_BUILD_LIMITS")
+    return out
 
 
 def state_dir():
@@ -45,51 +86,150 @@ def alive(pid):
         return e.errno == errno.EPERM
 
 
+def write_atomic(path, text):
+    tmp = "%s.%d" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.rename(tmp, path)
+
+
 def read_info(d, slot):
-    """The slot's last recorded holder as a dict, or None. The record outlives its holder."""
+    """The slot's last recorded holder, or None. The record outlives its holder."""
     try:
         with open(os.path.join(d, "slot.%s.info" % slot)) as f:
             line = f.readline().strip()
     except OSError:
         return None
-    out = {}
     head, _, label = line.partition(" label=")
-    for part in head.split():
-        k, _, v = part.partition("=")
-        out[k] = v
-    out["label"] = label
+    out = dict(p.partition("=")[::2] for p in head.split())
     try:
-        out["holder"], out["owner"], out["since"] = int(out["holder"]), int(out["owner"]), int(out["since"])
+        return {"holder": int(out["holder"]), "owner": int(out["owner"]), "since": int(out["since"]), "label": label}
     except (KeyError, ValueError):
         return None
+
+
+def ps_field(pid, field):
+    try:
+        return subprocess.run(["ps", "-o", field + "=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    except OSError:
+        return ""
+
+
+def clock_seconds(text):
+    days, _, clock = text.strip().rpartition("-")
+    t = 0.0
+    for part in clock.split(":"):
+        t = t * 60 + float(part or 0)
+    return t + 86400 * (int(days) if days else 0)
+
+
+class FileLock:
+    """flock(2) on DIR/slot.NAME: the kernel drops it when the holding process exits."""
+
+    def __init__(self, d, slot):
+        self.d, self.slot, self.fd = d, slot, None
+
+    def try_take(self):
+        fd = os.open(os.path.join(self.d, "slot." + self.slot), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        self.fd = fd
+        return True
+
+    def release(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def holder(self):
+        """None when free; else the recorded holder, or {} when it left no record."""
+        if self.fd is not None:
+            return read_info(self.d, self.slot) or {}
+        if self.try_take():
+            self.release()
+            return None
+        info = read_info(self.d, self.slot)
+        return info if info and alive(info["holder"]) else {}
+
+
+class PidLock:
+    """A lock other tools already use: PATH holds the owner's PID, replaced under flock(PATH.guard).
+    It is free whenever that PID is dead, so it cannot go stale either."""
+
+    def __init__(self, d, path):
+        self.d, self.path, self.mine = d, path, False
+
+    def _guarded(self, fn):
+        with open(self.path + ".guard", "a") as guard:
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            return fn()
+
+    def _owner(self):
+        try:
+            with open(self.path) as f:
+                pid = int(f.readline().strip() or 0)
+        except (OSError, ValueError):
+            return None
+        return pid if pid > 0 and alive(pid) else None
+
+    def try_take(self):
+        def claim():
+            if self._owner() not in (None, os.getpid()):
+                return False
+            write_atomic(self.path, "%d\n" % os.getpid())
+            return True
+
+        self.mine = self._guarded(claim)
+        return self.mine
+
+    def release(self):
+        def drop():
+            if self._owner() == os.getpid():
+                os.unlink(self.path)
+
+        if self.mine:
+            self._guarded(drop)
+            self.mine = False
+
+    def holder(self):
+        pid = self._owner()
+        if pid is None:
+            return None
+        info = read_info(self.d, GPU)
+        if info and info["holder"] == pid:
+            return info
+        age = clock_seconds(ps_field(pid, "etime") or "0")
+        return {"holder": pid, "owner": pid, "since": int(time.time() - age), "label": ps_field(pid, "command")[:120]}
+
+
+def lock_for(d, slot):
+    return PidLock(d, GPU_PIDFILE) if slot == GPU and GPU_PIDFILE else FileLock(d, slot)
+
+
+def held_above(d):
+    """Slots this process already runs under, from the variables holders export to their commands."""
+    claims = []
+    for entry in filter(None, os.environ.get(OWN_VAR, "").split(";")):
+        pid, _, slots = entry.partition(":")
+        claims += [(pid, s) for s in slots.split(",")]
+    if COMPAT_VAR:
+        claims.append(tuple(os.environ.get(COMPAT_VAR, "").partition(":")[::2]))
+    if GPU_VAR:
+        claims.append((os.environ.get(GPU_VAR, ""), GPU))
+    out = set()
+    for pid, slot in claims:
+        if slot in SLOTS and pid.isdigit() and alive(int(pid)):
+            h = lock_for(d, slot).holder()
+            if h and h.get("holder") == int(pid):
+                out.add(slot)
     return out
 
 
-def holds(d, slots):
-    """True when this process was started under one of `slots` by a holder that is still alive."""
-    pid, _, slot = os.environ.get(HELD_VAR, "").partition(":")
-    if slot not in slots or not pid.isdigit() or not alive(int(pid)):
-        return False
-    info = read_info(d, slot)
-    return bool(info) and info["holder"] == int(pid)
-
-
-def is_free(d, slot):
-    try:
-        fd = os.open(os.path.join(d, "slot." + slot), os.O_RDWR | os.O_CREAT, 0o644)
-    except OSError:
-        return True
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    except OSError:
-        return False
-    finally:
-        os.close(fd)
-
-
-def cpu_seconds(roots):
-    """Total CPU time used so far by `roots` and all their descendants."""
+def cpu_seconds(root):
+    """Total CPU time used so far by `root` and all its descendants."""
     try:
         out = subprocess.run(["ps", "-Ao", "pid=,ppid=,time="], capture_output=True, text=True).stdout
     except OSError:
@@ -97,31 +237,44 @@ def cpu_seconds(roots):
     kids, used = {}, {}
     for line in out.splitlines():
         f = line.split()
-        if len(f) != 3 or not f[0].isdigit():
-            continue
-        pid, ppid = int(f[0]), int(f[1])
-        days, _, clock = f[2].rpartition("-")
-        t = 0.0
-        for part in clock.split(":"):
-            t = t * 60 + float(part)
-        used[pid] = t + 86400 * (int(days) if days else 0)
-        kids.setdefault(ppid, []).append(pid)
-    total, todo, seen = 0.0, list(roots), set()
+        if len(f) == 3 and f[0].isdigit():
+            used[int(f[0])] = clock_seconds(f[2])
+            kids.setdefault(int(f[1]), []).append(int(f[0]))
+    total, todo, seen = 0.0, [root], set()
     while todo:
         p = todo.pop()
-        if p in seen:
-            continue
-        seen.add(p)
-        total += used.get(p, 0.0)
-        todo.extend(kids.get(p, []))
+        if p not in seen:
+            seen.add(p)
+            total += used.get(p, 0.0)
+            todo.extend(kids.get(p, []))
     return total
 
 
-def activity(pids):
-    """'busy' or 'idle' for each process tree, from CPU time used over one second."""
-    before = {p: cpu_seconds([p]) for p in pids}
-    time.sleep(1.0)
-    return {p: ("busy" if cpu_seconds([p]) - before[p] > 0.01 else "idle") for p in pids}
+def memory():
+    """(available bytes, total bytes), or None where it cannot be read."""
+    try:
+        if sys.platform == "darwin":
+            total = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True).stdout)
+            out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+            page = int(out.split("page size of")[1].split()[0])
+            pages = 0
+            for line in out.splitlines():
+                key, _, val = line.partition(":")
+                if key in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
+                    pages += int(val.strip().rstrip("."))
+            return pages * page, total
+        fields = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                key, _, val = line.partition(":")
+                fields[key] = int(val.split()[0]) * 1024
+        return fields["MemAvailable"], fields["MemTotal"]
+    except (OSError, ValueError, KeyError, IndexError):
+        return None
+
+
+def floor_pct():
+    return float(os.environ.get("AGENT_BUILD_MIN_FREE_PCT", "10"))
 
 
 def ago(since):
@@ -130,10 +283,10 @@ def ago(since):
 
 
 def jobs(d):
-    """Live jobs started by this tool (waiting or running), oldest first. Dead ones are swept."""
+    """Live jobs started by this tool, in queue order. Dead ones are swept."""
     out = []
     for name in os.listdir(d):
-        if not name.startswith("job."):
+        if not name.startswith("job.") or name.count(".") != 1:
             continue
         path = os.path.join(d, name)
         try:
@@ -149,45 +302,49 @@ def jobs(d):
                     os.unlink(stale)
                 except OSError:
                     pass
-    return sorted(out, key=lambda j: j["since"])
+    return sorted(out, key=lambda j: j.get("seq", 0))
 
 
-def try_lock(fd, seconds):
-    """Poll for the lock for up to `seconds`. True once held."""
-    end = time.time() + seconds
-    while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
-        except OSError:
-            if time.time() >= end:
-                return False
-            time.sleep(0.05)
+def next_seq(d):
+    with open(os.path.join(d, "seq"), "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.seek(0)
+        n = int(f.read().strip() or 0) + 1
+        f.seek(0)
+        f.truncate()
+        f.write(str(n))
+        return n
 
 
-def write_atomic(path, text):
-    tmp = "%s.%d" % (path, os.getpid())
-    with open(tmp, "w") as f:
-        f.write(text)
-    os.rename(tmp, path)
+def names(slots):
+    return "+".join(NAMES[s] for s in SLOTS if s in slots)
 
 
 class Stop(Exception):
-    """A stop signal arrived while this job was still waiting for its slot."""
+    """A stop signal arrived while this job was still waiting for its slots."""
 
 
-def run(slot, cmd):
+def run(want, cmd, mem_gb, max_wait_min, declared):
     d = state_dir()
-    if os.environ.get("AGENT_BUILD", "on") == "off" or holds(d, [HEAVY] if slot == HEAVY else [HEAVY, LIGHT]):
+    if os.environ.get("AGENT_BUILD", "on") == "off":
+        os.execvp(cmd[0], cmd)
+    above = held_above(d)
+    need = [s for s in SLOTS if s in want and s not in above]
+    if not need:
         os.execvp(cmd[0], cmd)
     me = os.getpid()
+    lim = limits()
+    limit_min, reason = declared if declared else (min(lim[s] for s in need), None)
     label = "%s in %s" % (os.path.basename(cmd[0]), os.getcwd())
     job_path = os.path.join(d, "job.%d" % me)
     cancel_path = os.path.join(d, "cancel.%d" % me)
     asked = time.time()
-    job = {"pid": me, "slot": slot, "state": "waiting", "since": int(asked), "label": label}
+    job = {"pid": me, "seq": next_seq(d), "slots": need, "state": "waiting", "since": int(asked), "label": label,
+           "mem_gb": mem_gb, "limit_min": limit_min, "reason": reason}
+    locks = {s: lock_for(d, s) for s in need}
     child = [None]
     stopped = [0]
+    over_limit = [False]
 
     def on_signal(signum, _frame):
         stopped[0] = signum
@@ -198,63 +355,120 @@ def run(slot, cmd):
         except OSError:
             pass
 
-    def cancel_reason():
-        try:
-            with open(cancel_path) as f:
-                return f.read().strip()
-        except OSError:
-            return None
+    def release_all():
+        for lock in locks.values():
+            lock.release()
 
     def finish(code):
-        reason = cancel_reason()
+        release_all()
+        try:
+            with open(cancel_path) as f:
+                why = f.read().strip()
+        except OSError:
+            why = None
         for p in (job_path, cancel_path):
             try:
                 os.unlink(p)
             except OSError:
                 pass
-        if reason is not None:
-            sys.stderr.write("agent-build: this job was cancelled. Reason given: %s\n" % reason)
-            return CANCELLED
+        if why is not None:
+            sys.stderr.write("agent-build: this job was cancelled. Reason given: %s\n" % why)
+            return STOPPED
+        if over_limit[0]:
+            sys.stderr.write(
+                "agent-build: this job was stopped after holding the %s slot for %g minutes, its limit. "
+                "If it needs longer, run it with --max-minutes N 'reason'.\n" % (names(need), limit_min))
+            return STOPPED
         return code
+
+    def try_all():
+        """Take every slot or none. Returns None when held, else what is in the way."""
+        mine = job["seq"]
+        others = jobs(d)
+        for j in others:
+            if j["state"] == "waiting" and j.get("seq", 0) < mine and set(j["slots"]) & set(need):
+                return ("queue", j)
+        mem = memory()
+        if mem:
+            recent = sum(j.get("mem_gb") or 0 for j in others if j["state"] == "running" and time.time() - j["since"] < 60)
+            left = mem[0] - (recent + (mem_gb or 0)) * 2 ** 30
+            if left < floor_pct() / 100 * mem[1]:
+                return ("memory", 100.0 * mem[0] / mem[1])
+        taken = []
+        for s in need:
+            if locks[s].try_take():
+                taken.append(s)
+            else:
+                # Never keep one shared lock while blocked on another.
+                for t in taken:
+                    locks[t].release()
+                return ("slot", s)
+        return None
+
+    def describe(block, busy=None):
+        kind, what = block
+        if kind == "queue":
+            return "pid %d, which is ahead in the queue for %s (%s)" % (what["pid"], names(what["slots"]), what["label"])
+        if kind == "memory":
+            return "memory: %.0f%% is available and the floor is %.0f%%" % (what, floor_pct())
+        h = locks[what].holder()
+        if not h:
+            return "the %s slot" % NAMES[what]
+        return "the %s slot, held by pid %d for %s%s (%s)" % (
+            NAMES[what], h["owner"], ago(h["since"]), ", %s now" % busy if busy else "", h["label"])
 
     for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(s, on_signal)
     write_atomic(job_path, json.dumps(job))
     try:
-        lock = os.open(os.path.join(d, "slot." + slot), os.O_RDWR | os.O_CREAT, 0o644)
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            # A holder can outlive its command by a moment, so retry briefly before announcing
-            # a wait, and keep retrying while measuring whether the holder is doing anything.
-            info = read_info(d, slot)
-            owner = info["owner"] if info and alive(info["holder"]) else None
-            if not try_lock(lock, 0.5):
-                before = cpu_seconds([owner]) if owner else 0.0
-                if not try_lock(lock, 1.0):
-                    who = "another job"
-                    if owner:
-                        state = "busy" if cpu_seconds([owner]) - before > 0.01 else "idle"
-                        who = "pid %d for %s, %s now (%s)" % (owner, ago(info["since"]), state, info["label"])
-                    sys.stderr.write(
-                        "agent-build: waiting for the %s slot, held by %s.\n"
-                        "agent-build: see the queue with `agent-build --status`; stop the holder with "
-                        "`agent-build --cancel 'why'`.\n" % (NAMES[slot], who)
-                    )
-                    fcntl.flock(lock, fcntl.LOCK_EX)
+        block = try_all()
+        probe = None  # (owner pid, cpu seconds, when) of the first holder seen, to tell busy from idle
+        announced = False
+        pause = 0.05
+        while block is not None:
+            waited = time.time() - asked
+            owner = None
+            if block[0] == "slot":
+                h = locks[block[1]].holder()
+                owner = h.get("owner") if h else None
+            if owner and probe is None and waited >= 0.3:
+                probe = (owner, cpu_seconds(owner), time.time())
+            if waited >= max_wait_min * 60:
+                sys.stderr.write(
+                    "agent-build: gave up after %s waiting for %s. Nothing was run. Retry later, wait longer "
+                    "with --max-wait MIN, or look at `agent-build --status`.\n" % (ago(asked), describe(block)))
+                return finish(GAVE_UP)
+            if not announced and waited >= 1.5:
+                busy = None
+                if probe and probe[0] == owner and time.time() - probe[2] >= 1.0:
+                    busy = "busy" if cpu_seconds(owner) - probe[1] > 0.01 else "idle"
+                sys.stderr.write(
+                    "agent-build: waiting for %s.\n"
+                    "agent-build: it gives up after %g minutes (--max-wait MIN). See the queue with "
+                    "`agent-build --status`.\n" % (describe(block, busy), max_wait_min))
+                announced = True
+            time.sleep(pause)
+            pause = min(pause * 1.5, 0.5)
+            block = try_all()
     except Stop:
         return finish(128 + stopped[0])
 
-    waited = time.time() - asked
-    write_atomic(os.path.join(d, "slot.%s.info" % slot), "holder=%d owner=%d since=%d label=%s\n" % (me, me, time.time(), label.replace("\n", " ")))
-    job.update(state="running", since=int(time.time()))
+    started = time.time()
+    for s in need:
+        write_atomic(os.path.join(d, "slot.%s.info" % s), "holder=%d owner=%d since=%d label=%s\n" % (me, me, started, label.replace("\n", " ")))
+    job.update(state="running", since=int(started))
     write_atomic(job_path, json.dumps(job))
-    if waited >= 1:
-        sys.stderr.write("agent-build: %s slot acquired after %.0f s.\n" % (NAMES[slot], waited))
+    if announced:
+        sys.stderr.write("agent-build: %s acquired after %s.\n" % (names(need), ago(asked)))
 
     env = dict(os.environ)
-    env[HELD_VAR] = "%d:%s" % (me, slot)
-    if slot == LIGHT:
+    env[OWN_VAR] = ";".join(filter(None, [os.environ.get(OWN_VAR, ""), "%d:%s" % (me, ",".join(need))]))
+    if COMPAT_VAR and (HEAVY in need or LIGHT in need):
+        env[COMPAT_VAR] = "%d:%s" % (me, HEAVY if HEAVY in need else LIGHT)
+    if GPU_VAR and GPU in need:
+        env[GPU_VAR] = str(me)
+    small = LIGHT in need and HEAVY not in need and HEAVY not in above
+    if small:
         env.setdefault("CARGO_BUILD_JOBS", "4")
     # Hand the terminal to the command only when this wrapper owns it (an interactive foreground run).
     try:
@@ -263,32 +477,40 @@ def run(slot, cmd):
         tty = False
 
     def in_child():
-        # Own process group, so a cancel reaches the whole build tree and nothing else.
+        # Own process group, so a stop reaches the whole job tree and nothing else.
         os.setpgid(0, 0)
         if tty:
             signal.signal(signal.SIGTTOU, signal.SIG_IGN)
             os.tcsetpgrp(0, os.getpgrp())
             signal.signal(signal.SIGTTOU, signal.SIG_DFL)
-        if slot == LIGHT:
+        if small:
             os.nice(10)
 
     try:
-        # The lock fd is not inherited (Python opens files close-on-exec), so a daemon the build
-        # leaves behind, such as a compiler cache server, cannot keep the slot.
+        # Lock descriptors are not inherited (Python opens files close-on-exec), so a daemon the
+        # job leaves behind, such as a compiler cache server, cannot keep a slot.
         try:
             child[0] = subprocess.Popen(cmd, env=env, preexec_fn=in_child)
         except OSError as e:
             sys.stderr.write("agent-build: cannot run %s: %s\n" % (cmd[0], e.strerror))
             return finish(127)
         code = None
-        deadline = None
+        kill_at = None
         while code is None:
             try:
                 code = child[0].wait(timeout=0.5)
             except subprocess.TimeoutExpired:
-                if stopped[0] and deadline is None:
-                    deadline = time.time() + GRACE_S
-                if deadline is not None and time.time() > deadline:
+                now = time.time()
+                if not stopped[0] and now - started > limit_min * 60:
+                    over_limit[0] = True
+                    stopped[0] = signal.SIGTERM
+                    try:
+                        os.killpg(child[0].pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+                if stopped[0] and kill_at is None:
+                    kill_at = now + GRACE_S
+                if kill_at is not None and now > kill_at:
                     try:
                         os.killpg(child[0].pid, signal.SIGKILL)
                     except OSError:
@@ -306,35 +528,47 @@ def run(slot, cmd):
 def status():
     d = state_dir()
     live = jobs(d)
-    held = {}
-    for slot in (HEAVY, LIGHT):
-        info = None if is_free(d, slot) else read_info(d, slot)
-        if info is not None and not alive(info["holder"]):
-            info = None
-        held[slot] = info
-    busy = activity([i["owner"] for i in held.values() if i])
-    for slot in (HEAVY, LIGHT):
-        info = held[slot]
-        if info is None:
-            print("%-5s free" % NAMES[slot])
+    ours = {j["pid"]: j for j in live}
+    lim = limits()
+    held = {s: lock_for(d, s).holder() for s in SLOTS}
+    owners = sorted({h["owner"] for h in held.values() if h})
+    before = {p: cpu_seconds(p) for p in owners}
+    if owners:
+        time.sleep(1.0)
+    busy = {p: ("busy" if cpu_seconds(p) - before[p] > 0.01 else "idle") for p in owners}
+    for s in SLOTS:
+        h = held[s]
+        if h is None:
+            print("%-6s free" % NAMES[s])
+        elif not h:
+            print("%-6s held by a job that left no record" % NAMES[s])
         else:
-            print("%-5s held %s by pid %d, %s now: %s" % (NAMES[slot], ago(info["since"]), info["owner"], busy[info["owner"]], info["label"]))
-        for j in live:
-            if j["slot"] == slot and j["state"] == "waiting":
-                print("      waiting %s: pid %d: %s" % (ago(j["since"]), j["pid"], j["label"]))
+            j = ours.get(h["owner"])
+            limit = j.get("limit_min", lim[s]) if j else lim[s]
+            note = "limit %gm%s" % (limit, ": " + j["reason"] if j and j.get("reason") else "")
+            if time.time() - h["since"] > limit * 60:
+                note = "OVER its limit of %gm%s" % (limit, "" if j else " (held through another tool, which does not enforce it)")
+            print("%-6s held %s by pid %d, %s now, %s: %s" % (NAMES[s], ago(h["since"]), h["owner"], busy[h["owner"]], note, h["label"]))
+    waiting = [j for j in live if j["state"] == "waiting"]
+    for n, j in enumerate(waiting, 1):
+        print("queue %d: pid %d, waiting %s for %s: %s" % (n, j["pid"], ago(j["since"]), names(j["slots"]), j["label"]))
+    mem = memory()
+    if mem:
+        print("memory %.0f%% available (jobs start above %.0f%%)" % (100.0 * mem[0] / mem[1], floor_pct()))
     return 0
 
 
 def cancel(args):
     d = state_dir()
+    holders = {s: lock_for(d, s).holder() for s in SLOTS}
     if args and args[0].isdigit():
         pid, reason = int(args[0]), " ".join(args[1:])
     else:
-        info = None if is_free(d, HEAVY) else read_info(d, HEAVY)
-        if info is None or not alive(info["holder"]):
-            sys.stderr.write("agent-build: the heavy slot is free; nothing to cancel. Name a PID from --status to cancel another job.\n")
+        h = holders[HEAVY]
+        if not h:
+            sys.stderr.write("agent-build: the heavy slot is free. Name a PID from --status to cancel another job.\n")
             return 1
-        pid, reason = info["owner"], " ".join(args)
+        pid, reason = h["owner"], " ".join(args)
     if not reason.strip():
         sys.stderr.write("agent-build: --cancel needs a reason; the job's owner will read it.\n")
         return 2
@@ -344,11 +578,9 @@ def cancel(args):
     ours = any(j["pid"] == pid for j in jobs(d))
     if ours:
         write_atomic(os.path.join(d, "cancel.%d" % pid), "%s (cancelled from %s)\n" % (reason.strip(), os.getcwd()))
-    else:
-        known = [i["owner"] for i in (read_info(d, s) for s in (HEAVY, LIGHT)) if i]
-        if pid not in known:
-            sys.stderr.write("agent-build: pid %d is not a job in this queue (see --status).\n" % pid)
-            return 1
+    elif pid not in [h["owner"] for h in holders.values() if h]:
+        sys.stderr.write("agent-build: pid %d is not a job in this queue (see --status).\n" % pid)
+        return 1
     try:
         os.kill(pid, signal.SIGTERM)
     except OSError as e:
@@ -360,8 +592,12 @@ def cancel(args):
     if alive(pid):
         print("agent-build: pid %d has not exited yet." % pid)
         return 1
-    print("agent-build: stopped pid %d%s." % (pid, "; it reported your reason to its caller" if ours else " (it holds the slot through another tool, so it could not be given the reason)"))
+    print("agent-build: stopped pid %d%s." % (pid, "; it reported your reason to its caller" if ours else " (it holds its slot through another tool, so it could not be given the reason)"))
     return 0
+
+
+USAGE = ("usage: agent-build [--light] [--gpu] [--sim] [--heavy] [--mem GB] [--max-wait MIN] "
+         "[--max-minutes N REASON] COMMAND [ARG ...]\n       agent-build --status | --cancel [PID] REASON | --help\n")
 
 
 def main(argv):
@@ -372,13 +608,38 @@ def main(argv):
         return status()
     if argv[0] == "--cancel":
         return cancel(argv[1:])
-    slot = HEAVY
-    if argv[0] == "--light":
-        slot, argv = LIGHT, argv[1:]
-    if not argv or argv[0].startswith("--"):
-        sys.stderr.write("usage: agent-build [--light] COMMAND [ARG ...] | --status | --cancel [PID] REASON\n")
+    want, mem_gb, declared = set(), None, None
+    max_wait = minutes(os.environ.get("AGENT_BUILD_MAX_WAIT", "10"), "AGENT_BUILD_MAX_WAIT")
+    i = 0
+    try:
+        while i < len(argv) and argv[i].startswith("--"):
+            opt = argv[i]
+            if opt == "--":
+                i += 1
+                break
+            if opt[2:] in IDS:
+                want.add(IDS[opt[2:]])
+                i += 1
+            elif opt == "--mem":
+                mem_gb = float(argv[i + 1])
+                i += 2
+            elif opt == "--max-wait":
+                max_wait = minutes(argv[i + 1], "--max-wait")
+                i += 2
+            elif opt == "--max-minutes":
+                declared = (minutes(argv[i + 1], "--max-minutes"), argv[i + 2].strip())
+                if not declared[1] or declared[1].startswith("--"):
+                    raise ValueError
+                i += 3
+            else:
+                raise ValueError
+    except (IndexError, ValueError):
+        sys.stderr.write(USAGE)
         return 2
-    return run(slot, argv)
+    if i >= len(argv):
+        sys.stderr.write(USAGE)
+        return 2
+    return run(want or {HEAVY}, argv[i:], mem_gb, max_wait, declared)
 
 
 if __name__ == "__main__":

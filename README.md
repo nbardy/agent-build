@@ -1,108 +1,170 @@
 # agent-build
 
-One heavy build at a time per machine, for machines where several coding agents (or people) work
-at once. Put it in front of any command that should not run beside another like it:
+Shared slots for heavy work on one machine, for machines where several coding agents (or people)
+work at once. Put it in front of anything heavy and say what the job needs:
 
 ```sh
-agent-build cargo build --release
-agent-build make -j8 test
+agent-build cargo build --release              # a full build or test suite
+agent-build --light cargo check -p parser      # a small check; runs beside a full build
+agent-build --gpu python render_batch.py       # the GPU
+agent-build --sim ./balance_batch --minutes 45 # one long CPU job, beside builds
+agent-build --gpu --heavy ./gpu_timing.sh      # a quiet GPU and no build running
 ```
 
-The second caller waits its turn instead of doubling the load. Unlike a bare lock, the queue is
-visible and a job can be stopped with a reason that reaches whoever started it.
+A job waits its turn instead of doubling the load. Unlike a bare lock, the queue is visible, no
+job waits or holds a slot without bound, and a job can be stopped with a reason that reaches
+whoever started it.
 
 ## Why
 
-Several agents compiling at once can make every build many times slower than running them in
-turn. A plain lock fixes that and creates a new problem: a job that holds the lock for a long
-time, perhaps without compiling anything, silently blocks everyone, and the only remedy is to
-kill it without telling its owner why. This tool keeps the lock and adds what was missing.
+Several agents compiling, rendering or simulating at once can make every job many times slower
+than running them in turn. A plain lock fixes that and creates new failures, each of which this
+tool exists to remove:
+
+| Failure with a plain lock | What agent-build does |
+|---|---|
+| A job that compiles nothing holds the build lock for an hour | Classes: declare `--gpu` or `--sim` and it does not take the build slot. Every class has a hold limit |
+| An agent blocks in the queue forever and never gets control back | The wait is bounded: after 10 minutes the command exits 69 and says who held the slot |
+| A job holds the GPU while it waits for a build slot | A job gets all of its slots or none: on any miss it releases everything and retries |
+| Nobody can see the queue | `--status` shows holders, their age, whether they are using CPU, the waiters and memory |
+| The only remedy is `kill`, and the owner never learns why | `--cancel REASON` stops the job's whole process tree and prints the reason on its stderr |
 
 ## Use
 
-| Command | What it does |
+```
+agent-build [CLASS ...] [OPTION ...] COMMAND [ARG ...]
+```
+
+| Class | Slot | For | Hold limit |
+|---|---|---|---:|
+| (none) or `--heavy` | heavy | A full build or test suite. One per machine | 30 min |
+| `--light` | light | One small job, at low priority (`CARGO_BUILD_JOBS` defaults to 4), beside the heavy one | 10 min |
+| `--gpu` | gpu | Renders, GPU benchmarks, training | 60 min |
+| `--sim` | sim | One long CPU job, such as a simulation batch, beside builds | 120 min |
+
+Classes combine. The job gets every slot it names, or waits holding none.
+
+| Option | Meaning |
 |---|---|
-| `agent-build COMMAND [ARG ...]` | Wait for the heavy slot, run the command, release the slot. Exit status is the command's. |
-| `agent-build --light COMMAND [ARG ...]` | Use the light slot: one small job at low priority that runs beside the heavy one, so a ten-second check never waits behind a long build. |
-| `agent-build --status` | Who holds each slot, for how long, whether it is using any CPU right now, and who is waiting. |
+| `--max-wait MIN` | Give up after MIN minutes in the queue (default 10). Exit 69; nothing was run. |
+| `--max-minutes N REASON` | Hold the slots up to N minutes instead of the class limit. The reason shows in `--status`. |
+| `--mem GB` | Memory the job will use. It starts only when that still leaves the free-memory floor. |
+
+| Command | Meaning |
+|---|---|
+| `agent-build --status` | Every slot's holder, age, busy or idle, and limit; the queue in order; available memory. |
 | `agent-build --cancel REASON` | Stop the job holding the heavy slot. |
-| `agent-build --cancel PID REASON` | Stop a specific job, running or waiting (PIDs are in `--status`). |
+| `agent-build --cancel PID REASON` | Stop any job, running or waiting (PIDs are in `--status`). |
 
-A waiting job says who it is waiting for, and how to look or intervene:
+Exit status is the command's own, except:
 
-```
-agent-build: waiting for the heavy slot, held by pid 4821 for 34m12s, idle now (python in /work/render).
-agent-build: see the queue with `agent-build --status`; stop the holder with `agent-build --cancel 'why'`.
-```
+| Status | Meaning | What the caller should do |
+|---:|---|---|
+| 69 | Gave up waiting. Nothing ran. The message names what was in the way | Do other work and retry, or pass `--max-wait` |
+| 75 | The job was cancelled (the reason is printed) or ran past its hold limit | Read the reason. For a long job, declare it with `--max-minutes N REASON` |
 
 ```
 $ agent-build --status
-heavy held 34m12s by pid 4821, idle now: python in /work/render
-      waiting 30m05s: pid 5170: cargo in /work/sim
-light free
+heavy  held 4m10s by pid 4821, busy now, limit 30m: cargo in /work/app
+light  free
+gpu    held 51m02s by pid 5170, idle now, limit 90m: nightly render set: python in /work/render
+sim    free
+queue 1: pid 6012, waiting 2m31s for heavy+gpu: gpu_timing.sh in /work/app
+memory 31% available (jobs start above 10%)
 ```
 
-A cancelled job stops its whole process tree, prints the reason on its own stderr and exits
-with status 75, so the agent or person who started it learns why:
+A waiting job says what it is waiting for and when it will give up:
 
 ```
-$ agent-build --cancel "render loop compiles nothing; run it without agent-build"
-agent-build: stopped pid 4821; it reported your reason to its caller.
+agent-build: waiting for the heavy slot, held by pid 4821 for 4m10s, busy now (cargo in /work/app).
+agent-build: it gives up after 10 minutes (--max-wait MIN). See the queue with `agent-build --status`.
 ```
 
+A cancelled job reports to its own caller:
+
 ```
-agent-build: this job was cancelled. Reason given: render loop compiles nothing; run it without agent-build (cancelled from /work/sim)
+$ agent-build --cancel 5170 "idle for 20 minutes while holding the GPU"
+agent-build: stopped pid 5170; it reported your reason to its caller.
 ```
+```
+agent-build: this job was cancelled. Reason given: idle for 20 minutes while holding the GPU (cancelled from /work/app)
+```
+
+## Guidance for agents
+
+Put something like this in the instructions file your agents read:
+
+> Run anything heavy through `agent-build`, with the class it needs: builds and test suites
+> (no flag), small single-package checks (`--light`), GPU work (`--gpu`), long CPU simulations
+> (`--sim`). Wrap the work, not the thinking: if you loop render, think, render, wrap each render
+> batch, so a slot is never held while you decide what to do next. If a command exits 69, the
+> queue was busy: do something else and retry. If it exits 75, read the reason.
 
 ## Install
 
-It is one file with no dependencies beyond Python 3.8+ and `ps`. Works on macOS and Linux.
+One file, no dependencies beyond Python 3.8+ and `ps`. macOS and Linux.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/nbardy/agent-build/main/agent-build -o ~/.local/bin/agent-build
 chmod +x ~/.local/bin/agent-build
 ```
 
-Then tell your agents, in whatever instructions file they read: *run builds and test suites
-through `agent-build`; do not wrap long simulations, renders or training runs in it.*
-
 ## How it works
 
-- A slot is `flock(2)` on a file, held by the wrapper process while the command runs as its
+- **Slots.** A slot is `flock(2)` on a file, held by the wrapper while the command runs as its
   child. The kernel releases it when the wrapper exits for any reason, so there are no stale
-  locks to clean up.
-- The lock's file descriptor is not passed to the command, so a daemon the build leaves behind
-  (a compiler cache server, for example) cannot keep the slot.
-- The command runs in its own process group. A cancel sends SIGTERM to the group and SIGKILL
-  after ten seconds.
-- "idle now" means the holder's whole process tree used no measurable CPU over one second.
-  It is a hint that a job may be holding the slot without building; nothing is stopped
-  automatically.
-- A command started under a slot that calls `agent-build` again runs at once (it already holds
-  the slot), so build scripts can use it freely.
-- Waiters are served in the order the kernel wakes them, which is not strictly first come,
-  first served.
+  locks. The lock's descriptor is not passed to the command, so a daemon the job leaves behind
+  (a compiler cache server, say) cannot keep a slot.
+- **All or nothing.** A job tries its slots in a fixed order without blocking. If any is taken
+  it releases the ones it got and tries again shortly. It never holds one shared lock while
+  waiting for another.
+- **Order.** Jobs are numbered as they arrive. A job does not try for its slots while an earlier
+  job that needs any of the same slots is still waiting, so waiters run first in, first out per
+  slot and a job that needs two slots is not starved by jobs that need one.
+- **Memory.** Nothing starts while available memory (after the job's `--mem`, and the `--mem`
+  of jobs started in the last minute) is under the floor. Available means free plus reclaimable
+  pages on macOS and `MemAvailable` on Linux.
+- **Limits.** The wrapper stops its own job when the hold limit passes: SIGTERM to the job's
+  process group, SIGKILL ten seconds later. A cancel works the same way.
+- **Idle.** "idle now" means the holder's whole process tree used no measurable CPU for one
+  second. It is a hint; nothing is stopped for being idle.
+- **Nesting.** A command started under a slot that calls `agent-build` again for the same slot
+  runs at once.
 
 ## Settings
 
-| Variable | Meaning |
+| Variable | Meaning | Default |
+|---|---|---|
+| `AGENT_BUILD=off` | Run commands directly, with no slots (a machine of your own) | on |
+| `AGENT_BUILD_DIR` | Where lock and job files live | `~/Library/Caches/agent-build` (macOS), `~/.cache/agent-build` |
+| `AGENT_BUILD_MAX_WAIT` | Default for `--max-wait`, minutes | 10 |
+| `AGENT_BUILD_LIMITS` | Hold limits in minutes, for example `heavy=45,gpu=90` | heavy 30, light 10, gpu 60, sim 120 |
+| `AGENT_BUILD_MIN_FREE_PCT` | Free-memory floor, percent of total; 0 turns it off | 10 |
+
+### Sharing locks with existing scripts
+
+If the machine already has lock scripts, agent-build can take the same locks, so old and new
+callers exclude each other in both directions.
+
+| Variable | For |
 |---|---|
-| `AGENT_BUILD=off` | Run commands directly, with no locking (a machine of your own). |
-| `AGENT_BUILD_DIR` | Where the lock and job files live. Default: `~/Library/Caches/agent-build` on macOS, `$XDG_CACHE_HOME/agent-build` or `~/.cache/agent-build` elsewhere. |
-| `AGENT_BUILD_ENV` | Name of the variable that marks "already inside a slot" for nested calls. Default `AGENT_BUILD_HELD`. |
-| `CARGO_BUILD_JOBS` | Left alone on the heavy slot; defaults to 4 on the light slot if unset. |
+| `AGENT_BUILD_DIR` | A `flock` gate that locks `slot.0` (heavy), `slot.light` or `slot.sim` in a directory and writes `holder=PID owner=PID since=EPOCH label=TEXT` to `slot.N.info` |
+| `AGENT_BUILD_ENV` | The variable that gate exports as `PID:N` to mark "already inside", so nested calls pass straight through either way |
+| `AGENT_BUILD_GPU_PIDFILE` | A GPU lock that is a file holding the owner's PID, replaced under `flock` of `FILE.guard`. The `--gpu` slot then uses that file |
+| `AGENT_BUILD_GPU_ENV` | The variable that GPU lock reads for nesting; it is set to the wrapper's PID |
 
-`AGENT_BUILD_DIR` and `AGENT_BUILD_ENV` exist so the tool can share lock files with an existing
-`flock`-based gate: any script that locks `slot.0` or `slot.light` in the same directory, writes
-`holder=PID owner=PID since=EPOCH label=TEXT` to `slot.N.info` and exports `PID:N` in the
-named variable excludes against it both ways. A job that holds a slot through such a script can
-be cancelled, but it cannot be given the reason.
+A job that holds a slot through such a script shows in `--status` and can be cancelled, but it
+cannot be given the reason, and its hold limit is flagged, not enforced.
 
-## Limits
+## Limits of the tool
 
-- If the wrapper itself is killed with SIGKILL, the slot is released but its command keeps
+- A legitimately long job that does not declare `--max-minutes` is stopped at its class limit
+  and that run is lost. This is deliberate: a slot held too long costs everyone else.
+- If the wrapper itself is killed with SIGKILL, its slots are released but its command keeps
   running unlocked.
-- The idle check is instantaneous. A build waiting on a network download looks idle.
+- Waiters poll, so a script outside this tool that re-takes a lock within milliseconds of
+  releasing it can starve them. The bounded wait turns that into exit 69, not a hang.
+- The idle check is instantaneous: a build waiting on a download looks idle.
 - One user per queue: a job can only be cancelled by a user allowed to signal it.
 
 ## Test
@@ -111,6 +173,6 @@ be cancelled, but it cannot be given the reason.
 ./test.sh
 ```
 
-Runs in a private temporary directory and checks mutual exclusion, the independent light slot,
-status output, cancel of a running job (reason delivered, children stopped) and of a waiting
-job, and nested calls.
+Runs in a private temporary directory: mutual exclusion, independent classes, all-or-nothing
+acquisition, first in first out, bounded wait, hold limits, the memory floor, status, cancel of
+running and waiting jobs, nested calls and the PID-file GPU lock.
