@@ -86,6 +86,24 @@ has "a job waiting for heavy+gpu holds neither" "$("$ab" --status)" "gpu    free
 t0=$SECONDS; "$ab" --gpu true; check "so another gpu job is not blocked by it" "$((SECONDS - t0 < 2))" 1
 wait
 
+# Catches: a waiter for several slots freezing the free ones for everyone behind it, and the
+# opposite, that waiter being overtaken forever.
+now() { perl -MTime::HiRes=time -e 'printf "%.1f", time'; }
+"$ab" sleep 3 &
+sleep 0.4
+"$ab" --gpu --heavy true 2>/dev/null &
+sleep 0.9
+t0=$(now); "$ab" --gpu true; t1=$(now)
+check "a later gpu job runs while an earlier heavy+gpu job waits on heavy" "$(perl -e "print(($t1 - $t0) < 1.0 ? 1 : 0)")" 1
+wait
+"$ab" sleep 3 &
+sleep 0.4
+AGENT_BUILD_STRICT_AFTER=0 "$ab" --gpu --heavy true 2>/dev/null &
+sleep 0.9
+t0=$(now); AGENT_BUILD_STRICT_AFTER=0 "$ab" --gpu true 2>/dev/null; t1=$(now)
+check "once the earlier job has waited long enough, it goes first" "$(perl -e "print(($t1 - $t0) > 1.0 ? 1 : 0)")" 1
+wait
+
 # Catches: a later job overtaking an earlier one for the same slot.
 "$ab" sleep 2 &
 sleep 0.4

@@ -118,9 +118,11 @@ chmod +x ~/.local/bin/agent-build
 - **All or nothing.** A job tries its slots in a fixed order without blocking. If any is taken
   it releases the ones it got and tries again shortly. It never holds one shared lock while
   waiting for another.
-- **Order.** Jobs are numbered as they arrive. A job does not try for its slots while an earlier
-  job that needs any of the same slots is still waiting, so waiters run first in, first out per
-  slot and a job that needs two slots is not starved by jobs that need one.
+- **Order.** Jobs are numbered as they arrive. A later job never takes the slot an earlier
+  waiter is blocked on, so each slot is first in, first out. An earlier waiter that needs
+  several slots leaves its other slots open to later jobs for its first two minutes
+  (`AGENT_BUILD_STRICT_AFTER`, seconds); after that it reserves all of them, so it cannot be
+  starved and free slots are not frozen behind it either.
 - **Memory.** Nothing starts while available memory (after the job's `--mem`, and the `--mem`
   of jobs started in the last minute) is under the floor. Available means free plus reclaimable
   pages on macOS and `MemAvailable` on Linux.
@@ -140,6 +142,7 @@ chmod +x ~/.local/bin/agent-build
 | `AGENT_BUILD_MAX_WAIT` | Default for `--max-wait`, minutes | 10 |
 | `AGENT_BUILD_LIMITS` | Hold limits in minutes, for example `heavy=45,gpu=90` | heavy 30, light 10, gpu 60, sim 120 |
 | `AGENT_BUILD_MIN_FREE_PCT` | Free-memory floor, percent of total; 0 turns it off | 10 |
+| `AGENT_BUILD_STRICT_AFTER` | Seconds a multi-slot waiter leaves its unblocked slots open to later jobs | 120 |
 
 ### Sharing locks with existing scripts
 

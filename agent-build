@@ -273,6 +273,10 @@ def memory():
         return None
 
 
+def strict_after_s():
+    return float(os.environ.get("AGENT_BUILD_STRICT_AFTER", "120"))
+
+
 def floor_pct():
     return float(os.environ.get("AGENT_BUILD_MIN_FREE_PCT", "10"))
 
@@ -387,7 +391,12 @@ def run(want, cmd, mem_gb, max_wait_min, declared):
         others = jobs(d)
         for j in others:
             if j["state"] == "waiting" and j.get("seq", 0) < mine and set(j["slots"]) & set(need):
-                return ("queue", j)
+                # An earlier waiter always goes first for the slot it is actually blocked on. Its
+                # other slots stay open to later jobs until it has waited STRICT_AFTER_S; from then
+                # on it reserves them all, so a job that needs several slots cannot be starved.
+                on = j.get("blocked_on")
+                if on is None or on in need or time.time() - j["since"] >= strict_after_s():
+                    return ("queue", j)
         mem = memory()
         if mem:
             recent = sum(j.get("mem_gb") or 0 for j in others if j["state"] == "running" and time.time() - j["since"] < 60)
@@ -447,6 +456,10 @@ def run(want, cmd, mem_gb, max_wait_min, declared):
                     "agent-build: it gives up after %g minutes (--max-wait MIN). See the queue with "
                     "`agent-build --status`.\n" % (describe(block, busy), max_wait_min))
                 announced = True
+            on = block[1] if block[0] == "slot" else None
+            if job.get("blocked_on") != on:
+                job["blocked_on"] = on
+                write_atomic(job_path, json.dumps(job))
             time.sleep(pause)
             pause = min(pause * 1.5, 0.5)
             block = try_all()
