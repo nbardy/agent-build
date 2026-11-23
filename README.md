@@ -129,7 +129,8 @@ chmod +x ~/.local/bin/agent-build
 - **Limits.** The wrapper stops its own job when the hold limit passes: SIGTERM to the job's
   process group, SIGKILL ten seconds later. A cancel works the same way.
 - **Idle.** "idle now" means the holder's whole process tree used no measurable CPU for one
-  second. It is a hint; nothing is stopped for being idle.
+  second. It is a hint; nothing is stopped for being idle. A GPU job can be fully busy with an
+  idle CPU, so on the gpu slot it reads "cpu idle (normal for GPU work)".
 - **Nesting.** A command started under a slot that calls `agent-build` again for the same slot
   runs at once.
 

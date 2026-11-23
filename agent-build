@@ -451,6 +451,8 @@ def run(want, cmd, mem_gb, max_wait_min, declared):
                 busy = None
                 if probe and probe[0] == owner and time.time() - probe[2] >= 1.0:
                     busy = "busy" if cpu_seconds(owner) - probe[1] > 0.01 else "idle"
+                    if busy == "idle" and block[1] == GPU:
+                        busy = None  # an idle CPU says nothing about a GPU job
                 sys.stderr.write(
                     "agent-build: waiting for %s.\n"
                     "agent-build: it gives up after %g minutes (--max-wait MIN). See the queue with "
@@ -549,6 +551,9 @@ def status():
     if owners:
         time.sleep(1.0)
     busy = {p: ("busy" if cpu_seconds(p) - before[p] > 0.01 else "idle") for p in owners}
+    # The busy/idle hint is CPU time. A GPU job can be working flat out with almost none, so on
+    # the gpu slot an idle CPU is reported as exactly that, not as an idle job.
+    label = lambda slot, pid: "cpu idle (normal for GPU work)" if slot == GPU and busy[pid] == "idle" else busy[pid] + " now"
     for s in SLOTS:
         h = held[s]
         if h is None:
@@ -561,7 +566,7 @@ def status():
             note = "limit %gm%s" % (limit, ": " + j["reason"] if j and j.get("reason") else "")
             if time.time() - h["since"] > limit * 60:
                 note = "OVER its limit of %gm%s" % (limit, "" if j else " (held through another tool, which does not enforce it)")
-            print("%-6s held %s by pid %d, %s now, %s: %s" % (NAMES[s], ago(h["since"]), h["owner"], busy[h["owner"]], note, h["label"]))
+            print("%-6s held %s by pid %d, %s, %s: %s" % (NAMES[s], ago(h["since"]), h["owner"], label(s, h["owner"]), note, h["label"]))
     waiting = [j for j in live if j["state"] == "waiting"]
     for n, j in enumerate(waiting, 1):
         print("queue %d: pid %d, waiting %s for %s: %s" % (n, j["pid"], ago(j["since"]), names(j["slots"]), j["label"]))
